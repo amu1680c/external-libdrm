@@ -1069,6 +1069,28 @@ check_bo_alloc_userptr(drm_intel_bufmgr *bufmgr,
 					  tiling_mode, stride, size, flags);
 }
 
+static int get_tiling_mode(drm_intel_bufmgr_gem *bufmgr_gem,
+			   uint32_t gem_handle,
+			   uint32_t *tiling_mode,
+			   uint32_t *swizzle_mode)
+{
+	struct drm_i915_gem_get_tiling get_tiling = {
+		.handle = gem_handle,
+	};
+	int ret;
+
+	ret = drmIoctl(bufmgr_gem->fd,
+		       DRM_IOCTL_I915_GEM_GET_TILING,
+		       &get_tiling);
+	if (ret != 0 && errno != EOPNOTSUPP)
+		return ret;
+
+	*tiling_mode = get_tiling.tiling_mode;
+	*swizzle_mode = get_tiling.swizzle_mode;
+
+	return 0;
+}
+
 /**
  * Returns a drm_intel_bo wrapping the given buffer object handle.
  *
@@ -1084,7 +1106,6 @@ drm_intel_bo_gem_create_from_name(drm_intel_bufmgr *bufmgr,
 	drm_intel_bo_gem *bo_gem;
 	int ret;
 	struct drm_gem_open open_arg;
-	struct drm_i915_gem_get_tiling get_tiling;
 
 	/* At the moment most applications only have a few named bo.
 	 * For instance, in a DRI client only the render buffers passed
@@ -1146,16 +1167,11 @@ drm_intel_bo_gem_create_from_name(drm_intel_bufmgr *bufmgr,
 	HASH_ADD(name_hh, bufmgr_gem->name_table,
 		 global_name, sizeof(bo_gem->global_name), bo_gem);
 
-	memclear(get_tiling);
-	get_tiling.handle = bo_gem->gem_handle;
-	ret = drmIoctl(bufmgr_gem->fd,
-		       DRM_IOCTL_I915_GEM_GET_TILING,
-		       &get_tiling);
+	ret = get_tiling_mode(bufmgr_gem, bo_gem->gem_handle,
+			      &bo_gem->tiling_mode, &bo_gem->swizzle_mode);
 	if (ret != 0)
 		goto err_unref;
 
-	bo_gem->tiling_mode = get_tiling.tiling_mode;
-	bo_gem->swizzle_mode = get_tiling.swizzle_mode;
 	/* XXX stride is unknown */
 	drm_intel_bo_gem_set_in_aperture_size(bufmgr_gem, bo_gem, 0);
 	DBG("bo_create_from_handle: %d (%s)\n", handle, bo_gem->name);
@@ -1716,6 +1732,82 @@ drm_intel_gem_bo_unmap_gtt(drm_intel_bo *bo)
 	return drm_intel_gem_bo_unmap(bo);
 }
 
+static bool is_cache_coherent(drm_intel_bo *bo)
+{
+	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *) bo->bufmgr;
+	drm_intel_bo_gem *bo_gem = (drm_intel_bo_gem *) bo;
+	struct drm_i915_gem_caching arg = {};
+
+	arg.handle = bo_gem->gem_handle;
+	if (drmIoctl(bufmgr_gem->fd, DRM_IOCTL_I915_GEM_GET_CACHING, &arg))
+		assert(false);
+	return arg.caching != I915_CACHING_NONE;
+}
+
+static void set_domain(drm_intel_bo *bo, uint32_t read, uint32_t write)
+{
+	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *) bo->bufmgr;
+	drm_intel_bo_gem *bo_gem = (drm_intel_bo_gem *) bo;
+	struct drm_i915_gem_set_domain arg = {};
+
+	arg.handle = bo_gem->gem_handle;
+	arg.read_domains = read;
+	arg.write_domain = write;
+	if (drmIoctl(bufmgr_gem->fd, DRM_IOCTL_I915_GEM_SET_DOMAIN, &arg))
+		assert(false);
+}
+
+static int mmap_write(drm_intel_bo *bo, unsigned long offset,
+		      unsigned long length, const void *buf)
+{
+	void *map = NULL;
+
+	if (!length)
+		return 0;
+
+	if (is_cache_coherent(bo)) {
+		map = drm_intel_gem_bo_map__cpu(bo);
+		if (map)
+			set_domain(bo, I915_GEM_DOMAIN_CPU, I915_GEM_DOMAIN_CPU);
+	}
+	if (!map) {
+		map = drm_intel_gem_bo_map__wc(bo);
+		if (map)
+			set_domain(bo, I915_GEM_DOMAIN_WC, I915_GEM_DOMAIN_WC);
+	}
+
+	assert(map);
+	memcpy((char *)map + offset, buf, length);
+	drm_intel_gem_bo_unmap(bo);
+	return 0;
+}
+
+static int mmap_read(drm_intel_bo *bo, unsigned long offset,
+		      unsigned long length, void *buf)
+{
+	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *) bo->bufmgr;
+	void *map = NULL;
+
+	if (!length)
+		return 0;
+
+	if (bufmgr_gem->has_llc || is_cache_coherent(bo)) {
+		map = drm_intel_gem_bo_map__cpu(bo);
+		if (map)
+			set_domain(bo, I915_GEM_DOMAIN_CPU, 0);
+	}
+	if (!map) {
+		map = drm_intel_gem_bo_map__wc(bo);
+		if (map)
+			set_domain(bo, I915_GEM_DOMAIN_WC, 0);
+	}
+
+	assert(map);
+	memcpy(buf, (char *)map + offset, length);
+	drm_intel_gem_bo_unmap(bo);
+	return 0;
+}
+
 static int
 drm_intel_gem_bo_subdata(drm_intel_bo *bo, unsigned long offset,
 			 unsigned long size, const void *data)
@@ -1736,14 +1828,20 @@ drm_intel_gem_bo_subdata(drm_intel_bo *bo, unsigned long offset,
 	ret = drmIoctl(bufmgr_gem->fd,
 		       DRM_IOCTL_I915_GEM_PWRITE,
 		       &pwrite);
-	if (ret != 0) {
+	if (ret)
 		ret = -errno;
+
+	if (ret != 0 && ret != -EOPNOTSUPP) {
 		DBG("%s:%d: Error writing data to buffer %d: (%d %d) %s .\n",
 		    __FILE__, __LINE__, bo_gem->gem_handle, (int)offset,
 		    (int)size, strerror(errno));
+		return ret;
 	}
 
-	return ret;
+	if (ret == -EOPNOTSUPP)
+		mmap_write(bo, offset, size, data);
+
+	return 0;
 }
 
 static int
@@ -1791,14 +1889,20 @@ drm_intel_gem_bo_get_subdata(drm_intel_bo *bo, unsigned long offset,
 	ret = drmIoctl(bufmgr_gem->fd,
 		       DRM_IOCTL_I915_GEM_PREAD,
 		       &pread);
-	if (ret != 0) {
+	if (ret)
 		ret = -errno;
+
+	if (ret != 0 && ret != -EOPNOTSUPP) {
 		DBG("%s:%d: Error reading data from buffer %d: (%d %d) %s .\n",
 		    __FILE__, __LINE__, bo_gem->gem_handle, (int)offset,
 		    (int)size, strerror(errno));
+		return ret;
 	}
 
-	return ret;
+	if (ret == -EOPNOTSUPP)
+		mmap_read(bo, offset, size, data);
+
+	return 0;
 }
 
 /** Waits for all GPU rendering with the object to have completed. */
@@ -2634,7 +2738,6 @@ drm_intel_bo_gem_create_from_prime(drm_intel_bufmgr *bufmgr, int prime_fd, int s
 	int ret;
 	uint32_t handle;
 	drm_intel_bo_gem *bo_gem;
-	struct drm_i915_gem_get_tiling get_tiling;
 
 	pthread_mutex_lock(&bufmgr_gem->lock);
 	ret = drmPrimeFDToHandle(bufmgr_gem->fd, prime_fd, &handle);
@@ -2688,15 +2791,11 @@ drm_intel_bo_gem_create_from_prime(drm_intel_bufmgr *bufmgr, int prime_fd, int s
 	bo_gem->has_error = false;
 	bo_gem->reusable = false;
 
-	memclear(get_tiling);
-	get_tiling.handle = bo_gem->gem_handle;
-	if (drmIoctl(bufmgr_gem->fd,
-		     DRM_IOCTL_I915_GEM_GET_TILING,
-		     &get_tiling))
+	ret = get_tiling_mode(bufmgr_gem, handle,
+			      &bo_gem->tiling_mode, &bo_gem->swizzle_mode);
+	if (ret)
 		goto err;
 
-	bo_gem->tiling_mode = get_tiling.tiling_mode;
-	bo_gem->swizzle_mode = get_tiling.swizzle_mode;
 	/* XXX stride is unknown */
 	drm_intel_bo_gem_set_in_aperture_size(bufmgr_gem, bo_gem, 0);
 
@@ -2717,7 +2816,7 @@ drm_intel_bo_gem_export_to_prime(drm_intel_bo *bo, int *prime_fd)
 	drm_intel_bo_gem *bo_gem = (drm_intel_bo_gem *) bo;
 
 	if (drmPrimeHandleToFD(bufmgr_gem->fd, bo_gem->gem_handle,
-			       DRM_CLOEXEC, prime_fd) != 0)
+			       DRM_CLOEXEC | DRM_RDWR, prime_fd) != 0)
 		return -errno;
 
 	bo_gem->reusable = false;
